@@ -61,10 +61,17 @@ plain `ds` provider in two ways, reflected in a separate set of macros:
 - `lat_rel_ind!` returns the type of every other (multi-valued) index. Because a row reference is
   re-inserted whenever its lattice value is joined upward, these indices must have *set* semantics (no
   duplicate row references).
+- `lat_observe!` is a hook, invoked once for every inserted row, that hands the provider the row's key
+  columns and its lattice value: `lat_observe!(name, field_types, [indices], ser|par, (), &key, &value)`.
+  Unlike the index macros (whose `Value` is always `usize`), this is the one place a provider sees the
+  lattice value itself, letting it maintain a derived view of the relation — e.g. an all-pairs
+  shortest-paths matrix computed from the edge weights. The default provider leaves it as a no-op.
 
-In both cases the `Value` type is always `usize` (a reference into the row store). A provider that does not
-define these macros simply cannot be used on a lattice. See `ascent::rel` for the default implementation,
-which maps `lat_full_ind!` to `RelFullIndexType`/`CRelFullIndex` and `lat_rel_ind!` to
-`LatticeIndexType`/`CRelIndex`/`CRelNoIndex`.
+For `lat_full_ind!` and `lat_rel_ind!` the `Value` type is always `usize` (a reference into the row
+store). A provider that does not define these three macros simply cannot be used on a lattice. See
+`ascent::rel` for the default implementation, which maps `lat_full_ind!` to `RelFullIndexType`/
+`CRelFullIndex`, `lat_rel_ind!` to `LatticeIndexType`/`CRelIndex`/`CRelNoIndex`, and `lat_observe!` to a
+no-op. For a worked example of a provider that uses `lat_observe!` to do real work, see
+`shortest_path_ds` in `ascent_tests/src/tests.rs`.
 
 **TODO**: finish the guide

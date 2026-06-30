@@ -1246,11 +1246,27 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
             .collect_vec();
          let lattice_key_tuple = tuple(&lattice_key_args);
 
+         // For a lattice with a `#[lds(..)]` provider, hand each inserted (key, lattice value) pair to the
+         // provider's `lat_observe!` hook. Unlike the index types, this hook sees the lattice value itself
+         // (not just a row reference), letting a provider maintain its own derived view of the relation.
+         // Lattices without an `lds` provider (and providers that leave `lat_observe!` as a no-op) emit
+         // nothing observable here.
+         let lattice_observe_code = if let Some(ds_attr) = &mir.relations_metadata[head_relation].lattice_ds_attr {
+            let macro_path = &ds_attr.path;
+            let macro_input = rel_ds_macro_input(head_relation, mir);
+            quote_spanned! {macro_path.span()=>
+               #macro_path::lat_observe!(#macro_input, &__lattice_key, &__new_row.#tuple_lat_index);
+            }
+         } else {
+            quote! {}
+         };
+
          let _self = quote! { _self };
          let add_row = if !mir.is_parallel {
             quote_spanned! {hcl.span=>
                let __new_row: #row_type = #new_row_tuple;
                let __lattice_key = #lattice_key_tuple;
+               #lattice_observe_code
                if let Some(mut __existing_ind) = #head_lat_full_index_var_name_new.index_get(&__lattice_key)
                   .or_else(|| #head_lat_full_index_var_name_delta.index_get(&__lattice_key))
                   .or_else(|| #head_lat_full_index_var_name_full.index_get(&__lattice_key))
@@ -1274,6 +1290,7 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
             quote_spanned! {hcl.span=> // mir.is_parallel:
                let __new_row: #row_type = #new_row_tuple;
                let __lattice_key = #lattice_key_tuple;
+               #lattice_observe_code
                let __existing_ind_in_new = #head_lat_full_index_var_name_new.get_cloned(&__lattice_key);
                let __new_has_ind = __existing_ind_in_new.is_some();
                if let Some(__existing_ind) = __existing_ind_in_new

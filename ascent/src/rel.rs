@@ -100,6 +100,17 @@ macro_rules! lat_rel_ind {
 }
 pub use lat_rel_ind;
 
+// `lat_observe!` is the hook through which a lattice `lds` provider sees each inserted (key, lattice
+// value) pair, separately from the index types (which only ever see a `usize` row reference). The default
+// provider keeps no derived view, so this expands to nothing. `$par` is `ser` or `par`; `$key` and `$val`
+// are references to the key tuple and the lattice value, respectively.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! lat_observe {
+   ($name: ident, $field_types: ty, $indices: expr, $par: tt, (), $key: expr, $val: expr) => {};
+}
+pub use lat_observe;
+
 #[derive(Clone)]
 pub struct ToRelIndexType<K, V>(pub RelIndexType1<K, V>);
 

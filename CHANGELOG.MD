@@ -1,7 +1,9 @@
 ## 0.9.0
 
 - BYODS for lattices: `lattice` relations can now use custom data structure providers for their indices via
-the new `#[lds(..)]` attribute, combining the BYODS and lattice features.
+the new `#[lds(..)]` attribute, combining the BYODS and lattice features. An `lds` provider may define a
+`lat_observe!` macro that receives each inserted row's key and lattice value, allowing it to maintain a
+derived view of the relation (the index macros only ever see a `usize` row reference).
 
 ## 0.8.1
 
