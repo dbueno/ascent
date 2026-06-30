@@ -1,3 +1,8 @@
+## 0.9.0
+
+- BYODS for lattices: `lattice` relations can now use custom data structure providers for their indices via
+the new `#[lds(..)]` attribute, combining the BYODS and lattice features.
+
 ## 0.8.1
 
 - Updated dependencies (instant -> webtime, paste -> pasty) (#75)

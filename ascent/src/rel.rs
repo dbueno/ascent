@@ -66,6 +66,40 @@ macro_rules! rel_ind {
 }
 pub use rel_ind;
 
+// The macros below define the default data structure provider for `lattice` relations, used both for
+// lattices without a `#[lds(..)]` attribute and for `#[lds(ascent::rel)]`. A lattice's rows live in the
+// built-in row store, so a lattice provider only customizes the index types: `lat_full_ind!` yields the
+// "full index" mapping the key columns (all but the lattice column) to the single row holding the joined
+// value, and `lat_rel_ind!` yields every other (multi-valued, set-semantics) index. `$val` is always
+// `usize` (a row reference).
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! lat_full_ind {
+   ($name: ident, $field_types: ty, $indices: expr, ser, (), $key: ty, $val: ty) => {
+      ascent::internal::RelFullIndexType<$key, $val>
+   };
+   ($name: ident, $field_types: ty, $indices: expr, par, (), $key: ty, $val: ty) => {
+      ascent::internal::CRelFullIndex<$key, $val>
+   };
+}
+pub use lat_full_ind;
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! lat_rel_ind {
+   ($name: ident, $field_types: ty, $indices: expr, ser, (), $ind: expr, $key: ty, $val: ty) => {
+      ascent::internal::LatticeIndexType<$key, $val>
+   };
+   ($name: ident, $field_types: ty, $indices: expr, par, (), [], $key: ty, $val: ty) => {
+      ascent::internal::CRelNoIndex<$val>
+   };
+   ($name: ident, $field_types: ty, $indices: expr, par, (), $ind: expr, $key: ty, $val: ty) => {
+      ascent::internal::CRelIndex<$key, $val>
+   };
+}
+pub use lat_rel_ind;
+
 #[derive(Clone)]
 pub struct ToRelIndexType<K, V>(pub RelIndexType1<K, V>);
 

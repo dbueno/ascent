@@ -94,8 +94,12 @@ pub(crate) struct AscentIr {
 pub(crate) struct RelationMetadata {
    pub initialization: Option<Rc<Expr>>,
    pub attributes: Rc<Vec<Attribute>>,
-   /// Will be `Some()` iff the relation is not a lattice
+   /// The data structure provider for a non-lattice relation. `Some()` iff the relation is not a lattice.
    pub ds_attr: Option<DsAttributeContents>,
+   /// The data structure provider for a lattice relation, specified via `#[lds(..)]`.
+   /// `Some()` only for lattices that opt in to a custom data structure provider; `None` means the
+   /// built-in lattice data structures are used (and is always `None` for non-lattice relations).
+   pub lattice_ds_attr: Option<DsAttributeContents>,
 }
 
 pub(crate) struct IrRule {
@@ -218,7 +222,8 @@ impl IrRelation {
 }
 
 const REL_DS_ATTR: &str = "ds";
-const RECOGNIIZED_REL_ATTRS: [&str; 1] = [REL_DS_ATTR];
+const REL_LATTICE_DS_ATTR: &str = "lds";
+const RECOGNIIZED_REL_ATTRS: [&str; 2] = [REL_DS_ATTR, REL_LATTICE_DS_ATTR];
 
 pub(crate) fn compile_ascent_program_to_hir(prog: &AscentProgram, is_parallel: bool) -> syn::Result<AscentIr> {
    let ir_rules: Vec<(IrRule, Vec<IrRelation>)> =
@@ -237,6 +242,7 @@ pub(crate) fn compile_ascent_program_to_hir(prog: &AscentProgram, is_parallel: b
 
    for (rel, rel_identity) in rel_identities {
       let ds_attribute = get_ds_attr(&rel.attrs)?;
+      let lattice_ds_attribute = get_lattice_ds_attr(&rel.attrs)?;
 
       if rel.is_lattice {
          let indices = (0..rel_identity.field_types.len() - 1).collect_vec();
@@ -257,9 +263,20 @@ pub(crate) fn compile_ascent_program_to_hir(prog: &AscentProgram, is_parallel: b
       let ds_attr = match (ds_attribute, rel.is_lattice) {
          (None, true) => None,
          (None, false) => Some(config.default_ds.clone()),
-         (Some(attr), true) =>
-            return Err(Error::new(attr.path.span(), "`lattice`s cannot have custom data structure providers")),
+         (Some(attr), true) => return Err(Error::new(
+            attr.path.span(),
+            "`lattice`s cannot have a `#[ds(..)]` data structure provider; use `#[lds(..)]` instead",
+         )),
          (Some(attr), false) => Some(attr),
+      };
+
+      let lattice_ds_attr = match (lattice_ds_attribute, rel.is_lattice) {
+         (None, _) => None,
+         (Some(attr), true) => Some(attr),
+         (Some(attr), false) => return Err(Error::new(
+            attr.path.span(),
+            "`#[lds(..)]` lattice data structure providers can only be used on `lattice`s",
+         )),
       };
 
       relations_metadata.insert(rel_identity.clone(), RelationMetadata {
@@ -274,6 +291,7 @@ pub(crate) fn compile_ascent_program_to_hir(prog: &AscentProgram, is_parallel: b
                .collect_vec(),
          ),
          ds_attr,
+         lattice_ds_attr,
       });
    }
    for (ir_rule, extra_relations) in ir_rules.iter() {
@@ -306,15 +324,24 @@ pub(crate) fn compile_ascent_program_to_hir(prog: &AscentProgram, is_parallel: b
 }
 
 fn get_ds_attr(attrs: &[Attribute]) -> syn::Result<Option<DsAttributeContents>> {
+   get_named_ds_attr(attrs, REL_DS_ATTR)
+}
+
+fn get_lattice_ds_attr(attrs: &[Attribute]) -> syn::Result<Option<DsAttributeContents>> {
+   get_named_ds_attr(attrs, REL_LATTICE_DS_ATTR)
+}
+
+fn get_named_ds_attr(attrs: &[Attribute], attr_name: &str) -> syn::Result<Option<DsAttributeContents>> {
    let ds_attrs =
-      attrs.iter().filter(|attr| attr.meta.path().get_ident().is_some_and(|ident| ident == REL_DS_ATTR)).collect_vec();
+      attrs.iter().filter(|attr| attr.meta.path().get_ident().is_some_and(|ident| ident == attr_name)).collect_vec();
    match &ds_attrs[..] {
       [] => Ok(None),
       [attr] => {
          let res = syn::parse2::<DsAttributeContents>(attr.meta.require_list()?.tokens.clone())?;
          Ok(Some(res))
       },
-      [_attr1, attr2, ..] => Err(Error::new(attr2.bracket_token.span.join(), "multiple `ds` attributes specified")),
+      [_attr1, attr2, ..] =>
+         Err(Error::new(attr2.bracket_token.span.join(), format!("multiple `{attr_name}` attributes specified"))),
    }
 }
 

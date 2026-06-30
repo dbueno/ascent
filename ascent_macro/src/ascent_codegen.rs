@@ -257,7 +257,9 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
 
    let mut rel_codegens = vec![];
    for rel in mir.relations_ir_relations.keys() {
-      let Some(ds_attr) = &mir.relations_metadata[rel].ds_attr else { continue };
+      let metadata = &mir.relations_metadata[rel];
+      let ds_attr = if rel.is_lattice { metadata.lattice_ds_attr.as_ref() } else { metadata.ds_attr.as_ref() };
+      let Some(ds_attr) = ds_attr else { continue };
       let macro_path = &ds_attr.path;
       let macro_input = rel_ds_macro_input(rel, mir);
       rel_codegens.push(quote_spanned! { macro_path.span()=> #macro_path::rel_codegen!{#macro_input} });
@@ -363,23 +365,37 @@ fn rel_index_type(rel: &IrRelation, mir: &AscentMir) -> Type {
    let is_lat_full_index = rel.relation.is_lattice && &mir.lattices_full_indices[&rel.relation] == rel;
 
    if rel.relation.is_lattice {
-      let res = if !mir.is_parallel {
+      // A lattice relation with a `#[lds(..)]` provider routes its index types through that provider's
+      // `lat_full_ind!`/`lat_rel_ind!` macros. Without a provider, the built-in lattice index types are used.
+      if let Some(ds_attr) = &mir.relations_metadata[&rel.relation].lattice_ds_attr {
+         let macro_path = &ds_attr.path;
+         let span = macro_path.span();
+         let macro_input = rel_ds_macro_input(&rel.relation, mir);
          if is_lat_full_index {
-            quote_spanned! { span=>ascent::internal::RelFullIndexType<#key_type, #value_type> }
+            parse_quote_spanned! {span=> #macro_path::lat_full_ind!(#macro_input, #key_type, #value_type)}
          } else {
-            quote_spanned! { span=>ascent::internal::LatticeIndexType<#key_type, #value_type> }
+            let ind = rel_index_to_macro_input(&rel.indices);
+            parse_quote_spanned! {span=> #macro_path::lat_rel_ind!(#macro_input, #ind, #key_type, #value_type)}
          }
       } else {
-         // parallel
-         if is_lat_full_index {
-            quote_spanned! { span=>ascent::internal::CRelFullIndex<#key_type, #value_type> }
-         } else if rel.is_no_index() {
-            quote_spanned! { span=>ascent::internal::CRelNoIndex<#value_type> }
+         let res = if !mir.is_parallel {
+            if is_lat_full_index {
+               quote_spanned! { span=>ascent::internal::RelFullIndexType<#key_type, #value_type> }
+            } else {
+               quote_spanned! { span=>ascent::internal::LatticeIndexType<#key_type, #value_type> }
+            }
          } else {
-            quote_spanned! { span=>ascent::internal::CRelIndex<#key_type, #value_type> }
-         }
-      };
-      syn::parse2(res).unwrap()
+            // parallel
+            if is_lat_full_index {
+               quote_spanned! { span=>ascent::internal::CRelFullIndex<#key_type, #value_type> }
+            } else if rel.is_no_index() {
+               quote_spanned! { span=>ascent::internal::CRelNoIndex<#value_type> }
+            } else {
+               quote_spanned! { span=>ascent::internal::CRelIndex<#key_type, #value_type> }
+            }
+         };
+         syn::parse2(res).unwrap()
+      }
    } else {
       let macro_path = &mir.relations_metadata[&rel.relation].ds_attr.as_ref().unwrap().path;
       let span = macro_path.span();
@@ -425,7 +441,9 @@ fn rel_ds_macro_input(rel: &RelationIdentity, mir: &AscentMir) -> TokenStream {
       .iter()
       .sorted_by_key(|r| &r.indices)
       .map(|ir_rel| rel_index_to_macro_input(&ir_rel.indices));
-   let args = &mir.relations_metadata[rel].ds_attr.as_ref().expect("must have the ds attribute").args;
+   let metadata = &mir.relations_metadata[rel];
+   let ds_attr = if rel.is_lattice { metadata.lattice_ds_attr.as_ref() } else { metadata.ds_attr.as_ref() };
+   let args = &ds_attr.expect("must have the ds attribute").args;
    let par: Ident = if mir.is_parallel {
       parse_quote_spanned! {span=> par}
    } else {

@@ -493,6 +493,101 @@ fn test_dl_lattice1() {
    ]))
 }
 
+/// A custom lattice data-structure provider, used to exercise the `#[lds(..)]` feature with a
+/// non-`ascent::rel` provider path. It delegates to the built-in lattice index data structures,
+/// demonstrating that an arbitrary provider path is resolved and its macros are invoked. A real
+/// provider would substitute its own index types here.
+mod my_lattice_ds {
+   #[macro_export]
+   macro_rules! my_lattice_ds_rel_codegen {
+      ($($tt: tt)*) => {};
+   }
+   pub use my_lattice_ds_rel_codegen as rel_codegen;
+
+   #[macro_export]
+   macro_rules! my_lattice_ds_lat_full_ind {
+      ($name: ident, $field_types: ty, $indices: expr, ser, (), $key: ty, $val: ty) => {
+         ascent::internal::RelFullIndexType<$key, $val>
+      };
+      ($name: ident, $field_types: ty, $indices: expr, par, (), $key: ty, $val: ty) => {
+         ascent::internal::CRelFullIndex<$key, $val>
+      };
+   }
+   pub use my_lattice_ds_lat_full_ind as lat_full_ind;
+
+   #[macro_export]
+   macro_rules! my_lattice_ds_lat_rel_ind {
+      ($name: ident, $field_types: ty, $indices: expr, ser, (), $ind: expr, $key: ty, $val: ty) => {
+         ascent::internal::LatticeIndexType<$key, $val>
+      };
+      ($name: ident, $field_types: ty, $indices: expr, par, (), [], $key: ty, $val: ty) => {
+         ascent::internal::CRelNoIndex<$val>
+      };
+      ($name: ident, $field_types: ty, $indices: expr, par, (), $ind: expr, $key: ty, $val: ty) => {
+         ascent::internal::CRelIndex<$key, $val>
+      };
+   }
+   pub use my_lattice_ds_lat_rel_ind as lat_rel_ind;
+}
+
+/// Same program as `test_dl_lattice1`, but the lattice relation uses the default data structure
+/// provider explicitly via `#[lds(ascent::rel)]`. Exercises the lattice BYODS code path.
+#[test]
+fn test_dl_lattice_lds_default() {
+   ascent_m_par! {
+      #[lds(ascent::rel)]
+      lattice shortest_path(i32, i32, Dual<u32>);
+      relation edge(i32, i32, u32);
+
+      shortest_path(*x, *y, Dual(*w)) <-- edge(x, y, w);
+      shortest_path(*x, *z, Dual(w + l.0)) <-- edge(x, y, w), shortest_path(y, z, l);
+
+      edge(1, 2, x + 30)  <-- for x in 0..100;
+      edge(2, 3, x + 50)  <-- for x in 0..100;
+      edge(1, 3, x + 40)  <-- for x in 0..100;
+      edge(2, 4, x + 100) <-- for x in 0..100;
+      edge(1, 4, x + 200) <-- for x in 0..100;
+   }
+   let mut prog = AscentProgram::default();
+   prog.run();
+   assert!(rels_equal(lat_to_vec(prog.shortest_path), [
+      (1, 2, Dual(30)),
+      (1, 3, Dual(40)),
+      (1, 4, Dual(130)),
+      (2, 3, Dual(50)),
+      (2, 4, Dual(100))
+   ]))
+}
+
+/// Same program, but the lattice relation uses a user-defined data structure provider via
+/// `#[lds(crate::tests::my_lattice_ds)]`. Exercises lattice BYODS with a custom provider path.
+#[test]
+fn test_dl_lattice_lds_custom() {
+   ascent_m_par! {
+      #[lds(crate::tests::my_lattice_ds)]
+      lattice shortest_path(i32, i32, Dual<u32>);
+      relation edge(i32, i32, u32);
+
+      shortest_path(*x, *y, Dual(*w)) <-- edge(x, y, w);
+      shortest_path(*x, *z, Dual(w + l.0)) <-- edge(x, y, w), shortest_path(y, z, l);
+
+      edge(1, 2, x + 30)  <-- for x in 0..100;
+      edge(2, 3, x + 50)  <-- for x in 0..100;
+      edge(1, 3, x + 40)  <-- for x in 0..100;
+      edge(2, 4, x + 100) <-- for x in 0..100;
+      edge(1, 4, x + 200) <-- for x in 0..100;
+   }
+   let mut prog = AscentProgram::default();
+   prog.run();
+   assert!(rels_equal(lat_to_vec(prog.shortest_path), [
+      (1, 2, Dual(30)),
+      (1, 3, Dual(40)),
+      (1, 4, Dual(130)),
+      (2, 3, Dual(50)),
+      (2, 4, Dual(100))
+   ]))
+}
+
 #[test]
 fn test_dl_lattice2() {
    ascent! {

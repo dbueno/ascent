@@ -37,4 +37,34 @@ These traits have `Key` and `Value` associated types. `Key` is the tuple of the 
 
 To support parallel Ascent, relation indices need to implement parallel versions of the above traits. For example, `CRelIndexRead`, `CRelIndexReadAll`, and `CRelIndexWrite`.
 
+## Lattices
+
+`lattice` relations can also use custom data structure providers, via the `#[lds(..)]` attribute (the
+ordinary `#[ds(..)]` attribute is rejected on lattices, and `#[lds(..)]` is rejected on non-lattice
+relations):
+
+```Rust
+ascent! {
+    #[lds(my_provider)]
+    lattice shortest_path(u32, u32, Dual<u32>);
+    // ...
+}
+```
+
+A lattice keeps its rows in the built-in row store (rows are mutated in place by the lattice `join`
+operation), so an `lds` provider only customizes the *index* data structures. The contract differs from a
+plain `ds` provider in two ways, reflected in a separate set of macros:
+
+- `lat_full_ind!` returns the type of the lattice "full index", which maps the key columns (all columns
+  except the final lattice column) to the single row holding the joined value for that key. The returned
+  type must support `index_get` (`RelIndexRead`), and, for parallel Ascent, `get_cloned` and `hash_usize`.
+- `lat_rel_ind!` returns the type of every other (multi-valued) index. Because a row reference is
+  re-inserted whenever its lattice value is joined upward, these indices must have *set* semantics (no
+  duplicate row references).
+
+In both cases the `Value` type is always `usize` (a reference into the row store). A provider that does not
+define these macros simply cannot be used on a lattice. See `ascent::rel` for the default implementation,
+which maps `lat_full_ind!` to `RelFullIndexType`/`CRelFullIndex` and `lat_rel_ind!` to
+`LatticeIndexType`/`CRelIndex`/`CRelNoIndex`.
+
 **TODO**: finish the guide
