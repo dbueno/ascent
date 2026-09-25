@@ -41,3 +41,15 @@ pub fn lat_to_vec<T>(vec: Vec<T>) -> Vec<T> { vec }
 pub fn lat_to_vec<T>(vec: ascent::boxcar::Vec<RwLock<T>>) -> Vec<T> {
    vec.into_iter().map(|x| x.into_inner().unwrap()).collect()
 }
+
+#[cfg(not(feature = "par"))]
+#[allow(dead_code)]
+pub fn lat_from_vec<T>(vec: Vec<T>) -> Vec<T> { vec }
+
+/// Builds a lattice relation's row store from a plain `Vec`, so a test can seed a lattice the same way in
+/// serial and parallel Ascent.
+#[cfg(feature = "par")]
+#[allow(dead_code)]
+pub fn lat_from_vec<T>(vec: Vec<T>) -> ascent::boxcar::Vec<RwLock<T>> {
+   vec.into_iter().map(RwLock::new).collect()
+}

@@ -100,14 +100,29 @@ macro_rules! lat_rel_ind {
 }
 pub use lat_rel_ind;
 
-// `lat_observe!` is the hook through which a lattice `lds` provider sees each inserted (key, lattice
-// value) pair, separately from the index types (which only ever see a `usize` row reference). The default
-// provider keeps no derived view, so this expands to nothing. `$par` is `ser` or `par`; `$key` and `$val`
-// are references to the key tuple and the lattice value, respectively.
+// `lat_state!` is the type of a lattice `lds` provider's own state. One value of it is stored in the
+// generated program struct per `#[lds(..)]` lattice, is never versioned or swapped by the fixpoint loop,
+// and is handed to `lat_observe!` by shared reference — so a provider that wants to accumulate anything
+// puts it here rather than in globals. In parallel Ascent it is shared across rayon worker threads, so it
+// must be `Sync` and use interior mutability. The default provider keeps no state.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! lat_state {
+   ($name: ident, $field_types: ty, $indices: expr, $par: tt, ()) => {
+      ()
+   };
+}
+pub use lat_state;
+
+// `lat_observe!` is the hook through which a lattice `lds` provider sees each (key, lattice value) pair
+// that actually enters the relation, separately from the index types (which only ever see a `usize` row
+// reference). The default provider keeps no derived view, so this expands to nothing. `$par` is `ser` or
+// `par`; `$state` is a shared reference to this relation's `lat_state!` value, and `$key` and `$val` are
+// references to the key tuple and the (already joined) lattice value.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! lat_observe {
-   ($name: ident, $field_types: ty, $indices: expr, $par: tt, (), $key: expr, $val: expr) => {};
+   ($name: ident, $field_types: ty, $indices: expr, $par: tt, (), $state: expr, $key: expr, $val: expr) => {};
 }
 pub use lat_observe;
 

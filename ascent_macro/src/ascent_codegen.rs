@@ -12,7 +12,7 @@ use crate::ascent_mir::{
    AscentMir, MirBodyItem, MirRelation, MirRelationVersion, MirRule, MirScc, ir_relation_version_var_name,
    mir_rule_summary, mir_summary,
 };
-use crate::ascent_syntax::{CondClause, RelationIdentity};
+use crate::ascent_syntax::{CondClause, DsAttributeContents, RelationIdentity};
 use crate::utils::{TokenStreamExtensions, exp_cloned, expr_to_ident, tuple, tuple_spanned, tuple_type};
 
 pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::TokenStream {
@@ -35,6 +35,16 @@ pub(crate) fn compile_mir(mir: &AscentMir, is_ascent_run: bool) -> proc_macro2::
          #rel_ind_common: #rel_ind_common_type,
       });
       field_defaults.push(quote! {#name : Default::default(), #rel_ind_common: Default::default(),});
+      if let Some(lat_state_type) = lat_state_type(rel, mir) {
+         let lat_state = lat_state_var_name(rel);
+         let lat_observed_count = lat_observed_count_var_name(rel);
+         relation_fields.push(quote! {
+            #[doc = "state of this lattice's `#[lds(..)]` data structure provider"]
+            pub #lat_state: #lat_state_type,
+            #lat_observed_count: ::std::sync::atomic::AtomicUsize,
+         });
+         field_defaults.push(quote! {#lat_state: Default::default(), #lat_observed_count: Default::default(),});
+      }
       if rel.is_lattice && mir.is_parallel {
          let lattice_mutex_name = lattice_insertion_mutex_var_name(rel);
          relation_fields.push(quote! {
@@ -802,6 +812,43 @@ fn compile_update_indices_function_body(mir: &AscentMir) -> proc_macro2::TokenSt
             });
          });
       }
+
+      // A lattice with an `#[lds(..)]` provider must also observe rows that were put into the relation
+      // directly — a pre-populated field, or a `= expr` initialization — rather than derived by a rule.
+      // Indexing is the only point at which Ascent learns of those rows. `__lat_observed_count` records how
+      // far observation has got, so that a repeated indexing pass (a second `run()`, or an explicit
+      // `update_indices()`) never observes the same row twice.
+      if lattice_ds_attr(r, mir).is_some() {
+         let lat_observed_count = lat_observed_count_var_name(r);
+         let lat_key_args: Vec<Expr> = (0..r.field_types.len() - 1)
+            .map(|i| {
+               let i_ind = syn::Index::from(i);
+               parse_quote_spanned! {r.name.span()=> tuple.#i_ind.clone()}
+            })
+            .collect_vec();
+         let lat_key_tuple = tuple_spanned(&lat_key_args, r.name.span());
+         let lat_index = syn::Index::from(r.field_types.len() - 1);
+         let observe = lat_observe_code(
+            r,
+            mir,
+            &_self,
+            &quote_spanned! {r.name.span()=> &__lattice_key},
+            &quote_spanned! {r.name.span()=> &tuple.#lat_index},
+         );
+         res.push(quote_spanned! {r.name.span()=>
+            {
+               let __observed_upto = #_self.#lat_observed_count.load(::std::sync::atomic::Ordering::Relaxed);
+               let __rel_len = #_self.#rel_name.len();
+               for _i in __observed_upto..__rel_len {
+                  let tuple = & #_self.#rel_name[_i];
+                  #maybe_lock
+                  let __lattice_key = #lat_key_tuple;
+                  #observe
+               }
+               #_self.#lat_observed_count.store(__rel_len, ::std::sync::atomic::Ordering::Relaxed);
+            }
+         });
+      }
    }
 
    quote! {
@@ -1246,27 +1293,63 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
             .collect_vec();
          let lattice_key_tuple = tuple(&lattice_key_args);
 
-         // For a lattice with a `#[lds(..)]` provider, hand each inserted (key, lattice value) pair to the
-         // provider's `lat_observe!` hook. Unlike the index types, this hook sees the lattice value itself
-         // (not just a row reference), letting a provider maintain its own derived view of the relation.
-         // Lattices without an `lds` provider (and providers that leave `lat_observe!` as a no-op) emit
-         // nothing observable here.
-         let lattice_observe_code = if let Some(ds_attr) = &mir.relations_metadata[head_relation].lattice_ds_attr {
-            let macro_path = &ds_attr.path;
-            let macro_input = rel_ds_macro_input(head_relation, mir);
-            quote_spanned! {macro_path.span()=>
-               #macro_path::lat_observe!(#macro_input, &__lattice_key, &__new_row.#tuple_lat_index);
+         let _self = quote! { _self };
+
+         // For a lattice with a `#[lds(..)]` provider, hand the row to the provider's `lat_observe!` hook.
+         // Unlike the index types, this hook sees the lattice value itself (not just a row reference),
+         // letting a provider maintain its own derived view of the relation. The value is read back out of
+         // the row store *after* the join, so the provider sees the value the row actually holds; callers
+         // below only invoke this on a row that was pushed or whose value the join changed, never on a
+         // proposed value that lost the join. Lattices without an `lds` provider emit nothing.
+         let lat_observe_row = |row_ind: TokenStream| -> TokenStream {
+            if lattice_ds_attr(head_relation, mir).is_none() {
+               return quote! {};
+            }
+            let bind_row = if mir.is_parallel {
+               quote_spanned! {hcl.span=> let __lat_observed_row = #_self.#head_rel_name[#row_ind].read().unwrap(); }
+            } else {
+               quote_spanned! {hcl.span=> let __lat_observed_row = & #_self.#head_rel_name[#row_ind]; }
+            };
+            let observe = lat_observe_code(
+               head_relation,
+               mir,
+               &_self,
+               &quote_spanned! {hcl.span=> &__lattice_key},
+               &quote_spanned! {hcl.span=> &__lat_observed_row.#tuple_lat_index},
+            );
+            quote_spanned! {hcl.span=> { #bind_row #observe } }
+         };
+         let lat_observe_existing = lat_observe_row(quote_spanned! {hcl.span=> __existing_ind});
+         let lat_observe_new = lat_observe_row(quote_spanned! {hcl.span=> __new_row_ind});
+
+         // The join under the parallel insertion mutex. Its result only matters to a provider's
+         // `lat_observe!` hook, so without one this stays the bare `join_mut` call it has always been.
+         let join_existing_under_mutex = {
+            let join = quote_spanned! {hcl.span=>
+               ::ascent::Lattice::join_mut(&mut #_self.#head_rel_name[__existing_ind].write().unwrap().#tuple_lat_index,
+                                           __new_row.#tuple_lat_index.clone())
+            };
+            if lattice_ds_attr(head_relation, mir).is_some() {
+               quote_spanned! {hcl.span=> if #join { #lat_observe_existing } }
+            } else {
+               quote_spanned! {hcl.span=> #join; }
+            }
+         };
+
+         // Rows added here are already observed, so record them as such: a later re-index (a second
+         // `run()`, or an explicit `update_indices()`) must not observe them a second time.
+         let lat_observed_count_bump = if lattice_ds_attr(head_relation, mir).is_some() {
+            let lat_observed_count = lat_observed_count_var_name(head_relation);
+            quote_spanned! {hcl.span=>
+               #_self.#lat_observed_count.fetch_max(__new_row_ind + 1, ::std::sync::atomic::Ordering::Relaxed);
             }
          } else {
             quote! {}
          };
-
-         let _self = quote! { _self };
          let add_row = if !mir.is_parallel {
             quote_spanned! {hcl.span=>
                let __new_row: #row_type = #new_row_tuple;
                let __lattice_key = #lattice_key_tuple;
-               #lattice_observe_code
                if let Some(mut __existing_ind) = #head_lat_full_index_var_name_new.index_get(&__lattice_key)
                   .or_else(|| #head_lat_full_index_var_name_delta.index_get(&__lattice_key))
                   .or_else(|| #head_lat_full_index_var_name_full.index_get(&__lattice_key))
@@ -1277,12 +1360,15 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
                   if __lat_changed {
                      let __new_row_ind = __existing_ind;
                      #(#update_indices)*
+                     #lat_observe_existing
                      #set_changed_true_code
                   }
                } else {
                   let __new_row_ind = #_self.#head_rel_name.len();
                   #(#update_indices)*
                   #_self.#head_rel_name.push(#new_row_to_be_pushed);
+                  #lat_observe_new
+                  #lat_observed_count_bump
                   #set_changed_true_code
                }
             }
@@ -1290,7 +1376,6 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
             quote_spanned! {hcl.span=> // mir.is_parallel:
                let __new_row: #row_type = #new_row_tuple;
                let __lattice_key = #lattice_key_tuple;
-               #lattice_observe_code
                let __existing_ind_in_new = #head_lat_full_index_var_name_new.get_cloned(&__lattice_key);
                let __new_has_ind = __existing_ind_in_new.is_some();
                if let Some(__existing_ind) = __existing_ind_in_new
@@ -1299,20 +1384,24 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
                {
                   let __lat_changed = ::ascent::Lattice::join_mut(&mut #_self.#head_rel_name[__existing_ind].write().unwrap().#tuple_lat_index,
                                                                   __new_row.#tuple_lat_index.clone());
-                  if __lat_changed && !__new_has_ind {
-                     let __new_row_ind = __existing_ind;
-                     #(#update_indices)*
-                     #set_changed_true_code
+                  if __lat_changed {
+                     #lat_observe_existing
+                     if !__new_has_ind {
+                        let __new_row_ind = __existing_ind;
+                        #(#update_indices)*
+                        #set_changed_true_code
+                     }
                   }
                } else {
                   let __hash = #head_lat_full_index_var_name_new.hash_usize(&__lattice_key);
                   let __lock = #_self.#lattice_insertion_mutex.get(__hash % #_self.#lattice_insertion_mutex.len()).expect("lattice_insertion_mutex index out of bounds").lock().unwrap();
                   if let Some(__existing_ind) = #head_lat_full_index_var_name_new.get_cloned(&__lattice_key) {
-                     ::ascent::Lattice::join_mut(&mut #_self.#head_rel_name[__existing_ind].write().unwrap().#tuple_lat_index,
-                                                 __new_row.#tuple_lat_index.clone());
+                     #join_existing_under_mutex
                   } else {
                      let __new_row_ind = #_self.#head_rel_name.push(::std::sync::RwLock::new(#new_row_to_be_pushed));
                      #(#update_indices)*
+                     #lat_observe_new
+                     #lat_observed_count_bump
                      #set_changed_true_code
                   }
                }
@@ -1322,6 +1411,47 @@ fn head_update_code(rule: &MirRule, scc: &MirScc, mir: &AscentMir) -> proc_macro
       }
    }
    quote! {#(#add_rows)*}
+}
+
+/// The `#[lds(..)]` data structure provider of a lattice relation, or `None` for a lattice without one and
+/// for every non-lattice relation (whose provider is `ds_attr` instead).
+fn lattice_ds_attr<'a>(rel: &RelationIdentity, mir: &'a AscentMir) -> Option<&'a DsAttributeContents> {
+   mir.relations_metadata[rel].lattice_ds_attr.as_ref()
+}
+
+/// Name of the field holding a lattice `lds` provider's own `lat_state!` value.
+fn lat_state_var_name(relation: &RelationIdentity) -> Ident {
+   Ident::new(&format!("__{}_lat_state", relation.name), relation.name.span())
+}
+
+/// Name of the field recording how many of a lattice's rows have already been passed to `lat_observe!`, so
+/// that re-indexing an existing row (`update_indices`, a second `run()`) does not observe it twice.
+fn lat_observed_count_var_name(relation: &RelationIdentity) -> Ident {
+   Ident::new(&format!("__{}_lat_observed_count", relation.name), relation.name.span())
+}
+
+/// The `lat_state!` type of a lattice with an `#[lds(..)]` provider; `None` for every other relation.
+fn lat_state_type(rel: &RelationIdentity, mir: &AscentMir) -> Option<Type> {
+   let ds_attr = lattice_ds_attr(rel, mir)?;
+   let macro_path = &ds_attr.path;
+   let macro_input = rel_ds_macro_input(rel, mir);
+   Some(parse_quote_spanned! { macro_path.span()=> #macro_path::lat_state!(#macro_input) })
+}
+
+/// Code handing one row of a lattice to its `#[lds(..)]` provider's `lat_observe!` hook, or nothing if the
+/// lattice has no provider. `self_expr` names the program, `key_expr` the row's key tuple, and `val_expr`
+/// the row's lattice value, which callers must read back *after* the join so the provider sees the value
+/// the row actually holds rather than the one that was proposed.
+fn lat_observe_code(
+   rel: &RelationIdentity, mir: &AscentMir, self_expr: &TokenStream, key_expr: &TokenStream, val_expr: &TokenStream,
+) -> TokenStream {
+   let Some(ds_attr) = lattice_ds_attr(rel, mir) else { return quote! {} };
+   let macro_path = &ds_attr.path;
+   let macro_input = rel_ds_macro_input(rel, mir);
+   let lat_state = lat_state_var_name(rel);
+   quote_spanned! {macro_path.span()=>
+      #macro_path::lat_observe!(#macro_input, & #self_expr.#lat_state, #key_expr, #val_expr);
+   }
 }
 
 fn lattice_insertion_mutex_var_name(head_relation: &RelationIdentity) -> Ident {
