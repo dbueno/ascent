@@ -1,10 +1,11 @@
 ## 0.9.0
 
 - BYODS for lattices: `lattice` relations can now use custom data structure providers for their indices via
-the new `#[lds(..)]` attribute, combining the BYODS and lattice features. An `lds` provider defines a
-`lat_state!` macro giving it a per-relation state value in the program struct, and a `lat_observe!` macro
-that receives the key and lattice value of every row entering the relation, allowing it to maintain a
-derived view (the index macros only ever see a `usize` row reference).
+the new `#[lds(..)]` attribute, combining the BYODS and lattice features. As with `#[ds(..)]`, a provider's
+`lat_ind_common!` value is shared by all of a lattice's indices through `ToRelIndex`, so one data structure
+can back every index. Its `LatIndCommon`/`CLatIndCommon` implementation receives the key and lattice value
+of every row entering the relation, allowing it to maintain a derived view (the indices only ever see a
+`usize` row reference). The parallel lattice full-index lookups are now the `CLatFullIndexRead` trait.
 
 ## 0.8.1
 

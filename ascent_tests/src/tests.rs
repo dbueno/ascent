@@ -494,9 +494,9 @@ fn test_dl_lattice1() {
 }
 
 /// A custom lattice data-structure provider, used to exercise the `#[lds(..)]` feature with a
-/// non-`ascent::rel` provider path. It delegates to the built-in lattice index data structures and keeps
-/// no state, demonstrating that an arbitrary provider path is resolved and its macros are invoked. A real
-/// provider would substitute its own index types here.
+/// non-`ascent::rel` provider path. It delegates to the built-in lattice index data structures and shares
+/// nothing between them, demonstrating that an arbitrary provider path is resolved and its macros are
+/// invoked. See `crate::btree_lat_ds` for a provider with index data structures of its own.
 mod my_lattice_ds {
    #[macro_export]
    macro_rules! my_lattice_ds_rel_codegen {
@@ -505,12 +505,12 @@ mod my_lattice_ds {
    pub use my_lattice_ds_rel_codegen as rel_codegen;
 
    #[macro_export]
-   macro_rules! my_lattice_ds_lat_state {
+   macro_rules! my_lattice_ds_lat_ind_common {
       ($name: ident, $field_types: ty, $indices: expr, $par: tt, ()) => {
          ()
       };
    }
-   pub use my_lattice_ds_lat_state as lat_state;
+   pub use my_lattice_ds_lat_ind_common as lat_ind_common;
 
    #[macro_export]
    macro_rules! my_lattice_ds_lat_full_ind {
@@ -536,12 +536,6 @@ mod my_lattice_ds {
       };
    }
    pub use my_lattice_ds_lat_rel_ind as lat_rel_ind;
-
-   #[macro_export]
-   macro_rules! my_lattice_ds_lat_observe {
-      ($name: ident, $ft: ty, $indices: expr, $par: tt, (), $state: expr, $key: expr, $val: expr) => {};
-   }
-   pub use my_lattice_ds_lat_observe as lat_observe;
 }
 
 /// Same program as `test_dl_lattice1`, but the lattice relation uses the default data structure
@@ -602,19 +596,20 @@ fn test_dl_lattice_lds_custom() {
    ]))
 }
 
-/// A lattice data-structure provider that records every `lat_observe!` call verbatim, used to pin down
-/// *which* rows the hook is invoked for. Its state is a `Mutex<Vec<..>>` held in the generated program
-/// struct via `lat_state!`, so it is per-program-instance and works from rayon worker threads.
+/// A lattice data-structure provider that records every `observe` call verbatim, used to pin down *which*
+/// rows the hook is invoked for. Its `lat_ind_common!` value is a `Recorder`; the fixpoint loop merges the
+/// recorders of the relation's versions into the one left in the program struct.
 mod recording_ds {
    use std::sync::Mutex;
 
-   /// Every `(key, lattice value)` pair handed to `lat_observe!`, in observation order.
+   use ascent::Dual;
+   use ascent::internal::{CLatIndCommon, Freezable, LatIndCommon, RelIndexMerge};
+
+   /// Every `(key, lattice value)` pair handed to `observe`, in observation order.
    #[derive(Default)]
    pub struct Recorder(Mutex<Vec<((i32, i32), u32)>>);
 
    impl Recorder {
-      pub fn record(&self, key: (i32, i32), val: u32) { self.0.lock().unwrap().push((key, val)); }
-
       pub fn observations(&self) -> Vec<((i32, i32), u32)> { self.0.lock().unwrap().clone() }
 
       /// The observed values for `key`, in observation order.
@@ -627,6 +622,23 @@ mod recording_ds {
       }
    }
 
+   impl LatIndCommon<(i32, i32), Dual<u32>> for Recorder {
+      fn observe(&mut self, key: &(i32, i32), val: &Dual<u32>) { self.0.get_mut().unwrap().push((*key, val.0)); }
+   }
+
+   impl CLatIndCommon<(i32, i32), Dual<u32>> for Recorder {
+      fn c_observe(&self, key: &(i32, i32), val: &Dual<u32>) { self.0.lock().unwrap().push((*key, val.0)); }
+   }
+
+   impl RelIndexMerge for Recorder {
+      // Older versions' observations come first, so the merged recorder stays in observation order.
+      fn move_index_contents(from: &mut Self, to: &mut Self) {
+         to.0.get_mut().unwrap().append(from.0.get_mut().unwrap());
+      }
+   }
+
+   impl Freezable for Recorder {}
+
    #[macro_export]
    macro_rules! recording_ds_rel_codegen {
       ($($tt: tt)*) => {};
@@ -634,12 +646,12 @@ mod recording_ds {
    pub use recording_ds_rel_codegen as rel_codegen;
 
    #[macro_export]
-   macro_rules! recording_ds_lat_state {
+   macro_rules! recording_ds_lat_ind_common {
       ($name: ident, $ft: ty, $indices: expr, $par: tt, ()) => {
          $crate::tests::recording_ds::Recorder
       };
    }
-   pub use recording_ds_lat_state as lat_state;
+   pub use recording_ds_lat_ind_common as lat_ind_common;
 
    #[macro_export]
    macro_rules! recording_ds_lat_full_ind {
@@ -665,21 +677,10 @@ mod recording_ds {
       };
    }
    pub use recording_ds_lat_rel_ind as lat_rel_ind;
-
-   #[macro_export]
-   macro_rules! recording_ds_lat_observe {
-      ($name: ident, $ft: ty, $indices: expr, $par: tt, (), $state: expr, $key: expr, $val: expr) => {{
-         let __state: &$crate::tests::recording_ds::Recorder = $state;
-         let __key = $key;
-         let __val = $val;
-         __state.record((__key.0, __key.1), __val.0);
-      }};
-   }
-   pub use recording_ds_lat_observe as lat_observe;
 }
 
 ascent_m_par! {
-   /// A `Dual<u32>` shortest-path lattice whose provider records every `lat_observe!` call.
+   /// A `Dual<u32>` shortest-path lattice whose provider records every `observe` call.
    pub struct RecordingProg;
 
    #[lds(crate::tests::recording_ds)]
@@ -690,7 +691,7 @@ ascent_m_par! {
    shortest_path(*x, *z, Dual(w + l.0)) <-- edge(x, y, w), shortest_path(y, z, l);
 }
 
-/// `lat_observe!` must only ever see values that the row actually holds, never a proposed value that lost
+/// `observe` must only ever see values that the row actually holds, never a proposed value that lost
 /// the lattice join. Because `Dual<u32>`'s join is `min`, a row's value only ever decreases, so the values
 /// observed for a key must form a strictly decreasing sequence ending at the row's final value. Observing
 /// discarded proposals (as an earlier version of this feature did, by running the hook before the join)
@@ -702,7 +703,7 @@ fn test_lds_observe_only_accepted_values() {
    prog.edge = vec![(1, 2, 30), (2, 3, 50), (1, 3, 40)].into_iter().collect();
    prog.run();
 
-   let recorder = std::mem::take(&mut prog.__shortest_path_lat_state);
+   let recorder = std::mem::take(&mut prog.__shortest_path_ind_common);
    let final_values: HashMap<(i32, i32), u32> =
       lat_to_vec(prog.shortest_path).into_iter().map(|(x, y, Dual(w))| ((x, y), w)).collect();
 
@@ -727,7 +728,7 @@ fn test_lds_observe_only_accepted_values() {
    assert_eq!(recorder.values_for((1, 3)), vec![40]);
 }
 
-/// Rows put into a lattice directly — rather than derived by a rule — must also reach `lat_observe!`;
+/// Rows put into a lattice directly — rather than derived by a rule — must also reach `observe`;
 /// indexing is the only point at which Ascent learns of them. Re-running the program must not observe
 /// those rows (or any already-observed row) a second time.
 #[test]
@@ -737,7 +738,7 @@ fn test_lds_observes_prepopulated_rows() {
    prog.edge = vec![(1, 2, 30)].into_iter().collect();
    prog.run();
 
-   let observations = prog.__shortest_path_lat_state.observations();
+   let observations = prog.__shortest_path_ind_common.observations();
    assert!(observations.contains(&((7, 8), 1)), "pre-populated row was not observed: {observations:?}");
    assert!(observations.contains(&((1, 2), 30)), "derived row was not observed: {observations:?}");
 
@@ -745,14 +746,14 @@ fn test_lds_observes_prepopulated_rows() {
    // checked in serial Ascent: calling `run()` twice already panics in parallel Ascent, `lds` or not.
    #[cfg(not(feature = "par"))]
    {
-      let before = prog.__shortest_path_lat_state.observations();
+      let before = prog.__shortest_path_ind_common.observations();
       prog.run();
-      assert_eq!(prog.__shortest_path_lat_state.observations(), before, "re-running observed rows a second time");
+      assert_eq!(prog.__shortest_path_ind_common.observations(), before, "re-running observed rows a second time");
    }
 }
 
 ascent_m_par! {
-   /// A lattice seeded by a relation initialization, whose provider records every `lat_observe!` call.
+   /// A lattice seeded by a relation initialization, whose provider records every `observe` call.
    pub struct RecordingInitProg;
 
    #[lds(crate::tests::recording_ds)]
@@ -769,172 +770,21 @@ ascent_m_par! {
 fn test_lds_observes_initialized_rows_once() {
    let mut prog = RecordingInitProg::default();
    prog.run();
-   assert_eq!(prog.__shortest_path_lat_state.observations(), vec![((5, 6), 9)]);
+   assert_eq!(prog.__shortest_path_ind_common.observations(), vec![((5, 6), 9)]);
 }
 
-/// A lattice data-structure provider that maintains an all-pairs shortest-paths view of a
-/// `lattice rel(from, to, Dual<weight>)` relation. It demonstrates a `#[lds(..)]` provider doing real,
-/// observable work: the `lat_observe!` hook receives every edge that enters the relation (the hook sees the
-/// actual `Dual` weight, which the index types never do), and on query the provider runs Floyd-Warshall
-/// over the accumulated edges to produce a distance matrix `D` and predecessor matrix `Pi`. This is what
-/// lets the test below drop the usual recursive transitive-closure rule entirely: the closure lives in the
-/// data structure, not in the Datalog rules.
-///
-/// The index types still delegate to the built-in lattice indices (so the relation's row store behaves
-/// normally). The derived view lives in the provider's `lat_state!` value, which the generated program
-/// struct owns — so it is scoped to one program instance and, in parallel Ascent, is shared across the
-/// rayon worker threads the hook runs on.
-mod shortest_path_ds {
-   use std::collections::HashMap;
-   use std::sync::Mutex;
-
-   /// Min observed weight for each `(from, to)` edge in the relation.
-   #[derive(Default)]
-   pub struct Edges(Mutex<HashMap<(i32, i32), u32>>);
-
-   impl Edges {
-      /// Records an edge, keeping the minimum weight seen for each `(from, to)` pair. Invoked by this
-      /// provider's `lat_observe!` hook for every row that enters the lattice.
-      pub fn observe_edge(&self, from: i32, to: i32, weight: u32) {
-         self.0.lock().unwrap().entry((from, to)).and_modify(|w| *w = (*w).min(weight)).or_insert(weight);
-      }
-
-      /// Runs Floyd-Warshall over the observed edges, returning the distance matrix `D` and predecessor
-      /// matrix `Pi` (`Pi[(i, j)]` is the node immediately before `j` on a shortest path from `i`).
-      fn floyd_warshall(&self) -> (HashMap<(i32, i32), u32>, HashMap<(i32, i32), i32>) {
-         let edges = self.0.lock().unwrap();
-         let mut nodes: Vec<i32> = edges.keys().flat_map(|&(a, b)| [a, b]).collect();
-         nodes.sort_unstable();
-         nodes.dedup();
-
-         let mut dist: HashMap<(i32, i32), u32> = HashMap::new();
-         let mut pred: HashMap<(i32, i32), i32> = HashMap::new();
-         for &n in &nodes {
-            dist.insert((n, n), 0);
-         }
-         for (&(a, b), &w) in edges.iter() {
-            dist.insert((a, b), w);
-            pred.insert((a, b), a);
-         }
-         for &k in &nodes {
-            for &i in &nodes {
-               let Some(&d_ik) = dist.get(&(i, k)) else { continue };
-               for &j in &nodes {
-                  let Some(&d_kj) = dist.get(&(k, j)) else { continue };
-                  let Some(through) = d_ik.checked_add(d_kj) else { continue };
-                  if dist.get(&(i, j)).is_none_or(|&d| through < d) {
-                     dist.insert((i, j), through);
-                     pred.insert((i, j), pred[&(k, j)]);
-                  }
-               }
-            }
-         }
-         (dist, pred)
-      }
-
-      /// All shortest paths between distinct nodes, as `(from, to, distance)`, sorted.
-      pub fn all_pairs(&self) -> Vec<(i32, i32, u32)> {
-         let (dist, _) = self.floyd_warshall();
-         let mut res: Vec<(i32, i32, u32)> =
-            dist.into_iter().filter(|&((i, j), _)| i != j).map(|((i, j), w)| (i, j, w)).collect();
-         res.sort_unstable();
-         res
-      }
-
-      /// Reconstructs the shortest path from `from` to `to` using the predecessor matrix, or an empty vec
-      /// if `to` is unreachable from `from`.
-      pub fn path(&self, from: i32, to: i32) -> Vec<i32> {
-         let (dist, pred) = self.floyd_warshall();
-         if from == to {
-            return vec![from];
-         }
-         if !dist.contains_key(&(from, to)) {
-            return vec![];
-         }
-         let mut rev = vec![to];
-         let mut cur = to;
-         while cur != from {
-            cur = pred[&(from, cur)];
-            rev.push(cur);
-         }
-         rev.reverse();
-         rev
-      }
-   }
-
-   #[macro_export]
-   macro_rules! shortest_path_ds_rel_codegen {
-      ($($tt: tt)*) => {};
-   }
-   pub use shortest_path_ds_rel_codegen as rel_codegen;
-
-   // Where the derived view lives: one `Edges` per `#[lds(..)]` lattice, owned by the program struct.
-   #[macro_export]
-   macro_rules! shortest_path_ds_lat_state {
-      ($name: ident, $ft: ty, $indices: expr, $par: tt, ()) => {
-         $crate::tests::shortest_path_ds::Edges
-      };
-   }
-   pub use shortest_path_ds_lat_state as lat_state;
-
-   #[macro_export]
-   macro_rules! shortest_path_ds_lat_full_ind {
-      ($name: ident, $ft: ty, $indices: expr, ser, (), $key: ty, $val: ty) => {
-         ascent::internal::RelFullIndexType<$key, $val>
-      };
-      ($name: ident, $ft: ty, $indices: expr, par, (), $key: ty, $val: ty) => {
-         ascent::internal::CRelFullIndex<$key, $val>
-      };
-   }
-   pub use shortest_path_ds_lat_full_ind as lat_full_ind;
-
-   #[macro_export]
-   macro_rules! shortest_path_ds_lat_rel_ind {
-      ($name: ident, $ft: ty, $indices: expr, ser, (), $ind: expr, $key: ty, $val: ty) => {
-         ascent::internal::LatticeIndexType<$key, $val>
-      };
-      ($name: ident, $ft: ty, $indices: expr, par, (), [], $key: ty, $val: ty) => {
-         ascent::internal::CRelNoIndex<$val>
-      };
-      ($name: ident, $ft: ty, $indices: expr, par, (), $ind: expr, $key: ty, $val: ty) => {
-         ascent::internal::CRelIndex<$key, $val>
-      };
-   }
-   pub use shortest_path_ds_lat_rel_ind as lat_rel_ind;
-
-   // The hook that makes this provider real: `$state` is `&Edges`, `$key` is `&(from, to)` and `$val` is
-   // `&Dual<weight>`, already joined. In parallel Ascent this runs on rayon worker threads, which is why
-   // the state is shared through the program struct rather than a thread-local.
-   #[macro_export]
-   macro_rules! shortest_path_ds_lat_observe {
-      ($name: ident, $ft: ty, $indices: expr, $par: tt, (), $state: expr, $key: expr, $val: expr) => {{
-         let __state: &$crate::tests::shortest_path_ds::Edges = $state;
-         let __key = $key;
-         let __val = $val;
-         __state.observe_edge(__key.0, __key.1, __val.0);
-      }};
-   }
-   pub use shortest_path_ds_lat_observe as lat_observe;
-}
-
-/// Exercises the `#[lds(..)]` annotation for real: the `shortest_path` lattice is backed by
-/// `shortest_path_ds`, which computes all-pairs shortest paths inside the data structure. The usual
-/// recursive transitive-closure rule is deleted — only the edge-seeding rule remains — so the closure
-/// exists *only* because the provider's `lat_observe!` hook saw the edge weights and ran Floyd-Warshall.
-/// If codegen failed to emit the hook, `all_pairs()` would be empty and this test would fail.
-///
-/// Uses `ascent_m_par!`, so under the `par` feature this also covers the hook being invoked from rayon
-/// worker threads: the observations have to reach the program-owned state to make the assertions pass.
+/// The `test_dl_lattice1` program, with the lattice backed by `crate::btree_lat_ds`: every index of
+/// `shortest_path` is answered from one `BTreeMap` per relation version, and none of Ascent's built-in
+/// lattice index data structures exist.
 #[test]
-fn test_dl_lattice_lds_shortest_path() {
+fn test_dl_lattice_lds_btree() {
    ascent_m_par! {
-      #[lds(crate::tests::shortest_path_ds)]
+      #[lds(crate::btree_lat_ds)]
       lattice shortest_path(i32, i32, Dual<u32>);
       relation edge(i32, i32, u32);
 
-      // Only the seeding rule: the recursive `shortest_path <-- edge, shortest_path` rule is gone. The
-      // data structure, not Datalog, computes the transitive closure / shortest paths.
       shortest_path(*x, *y, Dual(*w)) <-- edge(x, y, w);
+      shortest_path(*x, *z, Dual(w + l.0)) <-- edge(x, y, w), shortest_path(y, z, l);
 
       edge(1, 2, x + 30)  <-- for x in 0..100;
       edge(2, 3, x + 50)  <-- for x in 0..100;
@@ -944,32 +794,89 @@ fn test_dl_lattice_lds_shortest_path() {
    }
    let mut prog = AscentProgram::default();
    prog.run();
-
-   // The all-pairs shortest paths — including the transitive 1->4 path of weight 130 — were computed by
-   // the data structure from the weights it observed.
-   assert_eq!(prog.__shortest_path_lat_state.all_pairs(), vec![
-      (1, 2, 30),
-      (1, 3, 40),
-      (1, 4, 130),
-      (2, 3, 50),
-      (2, 4, 100),
-   ]);
-
-   // The predecessor matrix reconstructs the actual shortest path: 1 -> 4 goes via 2 (cost 30 + 100),
-   // beating the direct edge of weight 200; the direct 1 -> 3 edge (40) beats 1 -> 2 -> 3 (80).
-   assert_eq!(prog.__shortest_path_lat_state.path(1, 4), vec![1, 2, 4]);
-   assert_eq!(prog.__shortest_path_lat_state.path(1, 3), vec![1, 3]);
-   assert_eq!(prog.__shortest_path_lat_state.path(3, 1), Vec::<i32>::new());
-
-   // The lattice row store only ever held the direct edges (their min weight per pair), since no rule
-   // derives transitive paths.
+   // The provider's map holds exactly one entry per row: it is the only index storage there is.
+   assert_eq!(prog.__shortest_path_ind_common.len(), prog.shortest_path.len());
    assert!(rels_equal(lat_to_vec(prog.shortest_path), [
       (1, 2, Dual(30)),
       (1, 3, Dual(40)),
-      (1, 4, Dual(200)),
+      (1, 4, Dual(130)),
       (2, 3, Dual(50)),
-      (2, 4, Dual(100)),
-   ]));
+      (2, 4, Dual(100))
+   ]))
+}
+
+/// All-pairs shortest distances between distinct nodes, by Floyd-Warshall: the oracle for
+/// `test_dl_lattice_lds_shortest_path`.
+fn floyd_warshall(edges: &[(i32, i32, u32)]) -> HashMap<(i32, i32), u32> {
+   let nodes = edges.iter().flat_map(|&(a, b, _)| [a, b]).sorted().dedup().collect_vec();
+   let mut dist: HashMap<(i32, i32), u32> = HashMap::new();
+   for &(a, b, w) in edges {
+      let d = dist.entry((a, b)).or_insert(w);
+      *d = (*d).min(w);
+   }
+   for &k in &nodes {
+      for &i in &nodes {
+         let Some(&d_ik) = dist.get(&(i, k)) else { continue };
+         for &j in &nodes {
+            let Some(&d_kj) = dist.get(&(k, j)) else { continue };
+            if dist.get(&(i, j)).is_none_or(|&d| d_ik + d_kj < d) {
+               dist.insert((i, j), d_ik + d_kj);
+            }
+         }
+      }
+   }
+   dist.retain(|&(i, j), _| i != j);
+   dist
+}
+
+/// Shortest paths computed by Datalog through `crate::btree_lat_ds`'s indices, checked against
+/// Floyd-Warshall on a pseudo-random graph with cycles. The recursive rule joins on the lattice's `[0]`
+/// index (a `BTreeMap` range query), the lattice join looks rows up in its `[0, 1]` full index, and the
+/// two query rules read it through `[0]` with a constant and through `[]`.
+#[test]
+fn test_dl_lattice_lds_shortest_path() {
+   ascent_m_par! {
+      #[lds(crate::btree_lat_ds)]
+      lattice shortest_path(i32, i32, Dual<u32>);
+      relation edge(i32, i32, u32);
+      relation from_origin(i32, u32);
+      relation all_dist(i32, i32, u32);
+
+      shortest_path(*x, *y, Dual(*w)) <-- edge(x, y, w);
+      shortest_path(*x, *z, Dual(w + l.0)) <-- edge(x, y, w), shortest_path(y, z, l);
+
+      from_origin(*y, l.0) <-- shortest_path(0, y, l);
+      all_dist(*x, *y, l.0) <-- shortest_path(x, y, l);
+   }
+
+   // A deterministic pseudo-random graph on 25 nodes, dense enough to have many cycles and many paths
+   // that improve on direct edges.
+   let mut seed: u64 = 0x5eed;
+   let mut next = move |n: u64| {
+      seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+      (seed >> 33) % n
+   };
+   let edges = (0..120).map(|_| (next(25) as i32, next(25) as i32, next(50) as u32 + 1)).collect_vec();
+   let expected = floyd_warshall(&edges);
+
+   let mut prog = AscentProgram::default();
+   prog.edge = edges.iter().cloned().collect();
+   prog.run();
+
+   // `shortest_path` also holds self-loops (i, i) for nodes on a cycle, which the oracle leaves out.
+   let computed: HashMap<(i32, i32), u32> =
+      lat_to_vec(prog.shortest_path).into_iter().map(|(x, y, Dual(w))| ((x, y), w)).collect();
+   let computed_non_loops: HashMap<(i32, i32), u32> =
+      computed.iter().filter(|((i, j), _)| i != j).map(|(&k, &v)| (k, v)).collect();
+   assert_eq!(computed_non_loops, expected);
+   assert!(computed.len() > 100, "graph too sparse to exercise the indices: {} paths", computed.len());
+
+   assert!(rels_equal(prog.all_dist, computed.iter().map(|(&(x, y), &w)| (x, y, w))));
+   assert!(rels_equal(
+      prog.from_origin,
+      computed.iter().filter(|((x, _), _)| *x == 0).map(|(&(_, y), &w)| (y, w))
+   ));
+   assert_eq!(prog.__shortest_path_ind_common.len(), computed.len());
 }
 
 #[test]

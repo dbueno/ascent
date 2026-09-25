@@ -7,7 +7,7 @@ use web_time::Instant;
 
 use crate::c_rel_index::{DashMapViewParIter, shards_count};
 use crate::internal::{
-   CRelFullIndexWrite, CRelIndexRead, CRelIndexReadAll, CRelIndexWrite, Freezable, RelFullIndexRead, RelFullIndexWrite,
+   CLatFullIndexRead, CRelFullIndexWrite, CRelIndexRead, CRelIndexReadAll, CRelIndexWrite, Freezable, RelFullIndexRead, RelFullIndexWrite,
    RelIndexMerge, RelIndexRead, RelIndexReadAll, RelIndexWrite,
 };
 
@@ -101,6 +101,15 @@ impl<K: Clone + Hash + Eq, V> CRelFullIndex<K, V> {
          },
       }
    }
+}
+
+impl<K: Clone + Hash + Eq, V: Clone> CLatFullIndexRead for CRelFullIndex<K, V> {
+   type Key = K;
+   type Value = V;
+   #[inline(always)]
+   fn hash_usize(&self, key: &K) -> usize { CRelFullIndex::hash_usize(self, key) }
+   #[inline(always)]
+   fn get_cloned(&self, key: &K) -> Option<V> { CRelFullIndex::get_cloned(self, key) }
 }
 
 impl<K: Clone + Hash + Eq, V> Default for CRelFullIndex<K, V> {
