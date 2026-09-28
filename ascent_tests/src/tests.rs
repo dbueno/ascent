@@ -14,7 +14,7 @@ use LambdaCalcExpr::*;
 use ascent::{Dual, ascent, ascent_run};
 use itertools::Itertools;
 
-use crate::ascent_maybe_par::lat_to_vec;
+use crate::ascent_maybe_par::{lat_from_vec, lat_to_vec};
 use crate::utils::*;
 use crate::{ascent_m_par, ascent_run_m_par, assert_rels_eq};
 
@@ -491,6 +491,392 @@ fn test_dl_lattice1() {
       (2, 3, Dual(50)),
       (2, 4, Dual(100))
    ]))
+}
+
+/// A custom lattice data-structure provider, used to exercise the `#[lds(..)]` feature with a
+/// non-`ascent::rel` provider path. It delegates to the built-in lattice index data structures and shares
+/// nothing between them, demonstrating that an arbitrary provider path is resolved and its macros are
+/// invoked. See `crate::btree_lat_ds` for a provider with index data structures of its own.
+mod my_lattice_ds {
+   #[macro_export]
+   macro_rules! my_lattice_ds_rel_codegen {
+      ($($tt: tt)*) => {};
+   }
+   pub use my_lattice_ds_rel_codegen as rel_codegen;
+
+   #[macro_export]
+   macro_rules! my_lattice_ds_lat_ind_common {
+      ($name: ident, $field_types: ty, $indices: expr, $par: tt, ()) => {
+         ()
+      };
+   }
+   pub use my_lattice_ds_lat_ind_common as lat_ind_common;
+
+   #[macro_export]
+   macro_rules! my_lattice_ds_lat_full_ind {
+      ($name: ident, $field_types: ty, $indices: expr, ser, (), $key: ty, $val: ty) => {
+         ascent::internal::RelFullIndexType<$key, $val>
+      };
+      ($name: ident, $field_types: ty, $indices: expr, par, (), $key: ty, $val: ty) => {
+         ascent::internal::CRelFullIndex<$key, $val>
+      };
+   }
+   pub use my_lattice_ds_lat_full_ind as lat_full_ind;
+
+   #[macro_export]
+   macro_rules! my_lattice_ds_lat_rel_ind {
+      ($name: ident, $field_types: ty, $indices: expr, ser, (), $ind: expr, $key: ty, $val: ty) => {
+         ascent::internal::LatticeIndexType<$key, $val>
+      };
+      ($name: ident, $field_types: ty, $indices: expr, par, (), [], $key: ty, $val: ty) => {
+         ascent::internal::CRelNoIndex<$val>
+      };
+      ($name: ident, $field_types: ty, $indices: expr, par, (), $ind: expr, $key: ty, $val: ty) => {
+         ascent::internal::CRelIndex<$key, $val>
+      };
+   }
+   pub use my_lattice_ds_lat_rel_ind as lat_rel_ind;
+}
+
+/// Same program as `test_dl_lattice1`, but the lattice relation uses the default data structure
+/// provider explicitly via `#[lds(ascent::rel)]`. Exercises the lattice BYODS code path.
+#[test]
+fn test_dl_lattice_lds_default() {
+   ascent_m_par! {
+      #[lds(ascent::rel)]
+      lattice shortest_path(i32, i32, Dual<u32>);
+      relation edge(i32, i32, u32);
+
+      shortest_path(*x, *y, Dual(*w)) <-- edge(x, y, w);
+      shortest_path(*x, *z, Dual(w + l.0)) <-- edge(x, y, w), shortest_path(y, z, l);
+
+      edge(1, 2, x + 30)  <-- for x in 0..100;
+      edge(2, 3, x + 50)  <-- for x in 0..100;
+      edge(1, 3, x + 40)  <-- for x in 0..100;
+      edge(2, 4, x + 100) <-- for x in 0..100;
+      edge(1, 4, x + 200) <-- for x in 0..100;
+   }
+   let mut prog = AscentProgram::default();
+   prog.run();
+   assert!(rels_equal(lat_to_vec(prog.shortest_path), [
+      (1, 2, Dual(30)),
+      (1, 3, Dual(40)),
+      (1, 4, Dual(130)),
+      (2, 3, Dual(50)),
+      (2, 4, Dual(100))
+   ]))
+}
+
+/// Same program, but the lattice relation uses a user-defined data structure provider via
+/// `#[lds(crate::tests::my_lattice_ds)]`. Exercises lattice BYODS with a custom provider path.
+#[test]
+fn test_dl_lattice_lds_custom() {
+   ascent_m_par! {
+      #[lds(crate::tests::my_lattice_ds)]
+      lattice shortest_path(i32, i32, Dual<u32>);
+      relation edge(i32, i32, u32);
+
+      shortest_path(*x, *y, Dual(*w)) <-- edge(x, y, w);
+      shortest_path(*x, *z, Dual(w + l.0)) <-- edge(x, y, w), shortest_path(y, z, l);
+
+      edge(1, 2, x + 30)  <-- for x in 0..100;
+      edge(2, 3, x + 50)  <-- for x in 0..100;
+      edge(1, 3, x + 40)  <-- for x in 0..100;
+      edge(2, 4, x + 100) <-- for x in 0..100;
+      edge(1, 4, x + 200) <-- for x in 0..100;
+   }
+   let mut prog = AscentProgram::default();
+   prog.run();
+   assert!(rels_equal(lat_to_vec(prog.shortest_path), [
+      (1, 2, Dual(30)),
+      (1, 3, Dual(40)),
+      (1, 4, Dual(130)),
+      (2, 3, Dual(50)),
+      (2, 4, Dual(100))
+   ]))
+}
+
+/// A lattice data-structure provider that records every `observe` call verbatim, used to pin down *which*
+/// rows the hook is invoked for. Its `lat_ind_common!` value is a `Recorder`; the fixpoint loop merges the
+/// recorders of the relation's versions into the one left in the program struct.
+mod recording_ds {
+   use std::sync::Mutex;
+
+   use ascent::Dual;
+   use ascent::internal::{CLatIndCommon, Freezable, LatIndCommon, RelIndexMerge};
+
+   /// Every `(key, lattice value)` pair handed to `observe`, in observation order.
+   #[derive(Default)]
+   pub struct Recorder(Mutex<Vec<((i32, i32), u32)>>);
+
+   impl Recorder {
+      pub fn observations(&self) -> Vec<((i32, i32), u32)> { self.0.lock().unwrap().clone() }
+
+      /// The observed values for `key`, in observation order.
+      pub fn values_for(&self, key: (i32, i32)) -> Vec<u32> {
+         self.observations().into_iter().filter(|&(k, _)| k == key).map(|(_, v)| v).collect()
+      }
+
+      pub fn keys(&self) -> std::collections::HashSet<(i32, i32)> {
+         self.observations().into_iter().map(|(k, _)| k).collect()
+      }
+   }
+
+   impl LatIndCommon<(i32, i32), Dual<u32>> for Recorder {
+      fn observe(&mut self, key: &(i32, i32), val: &Dual<u32>) { self.0.get_mut().unwrap().push((*key, val.0)); }
+   }
+
+   impl CLatIndCommon<(i32, i32), Dual<u32>> for Recorder {
+      fn c_observe(&self, key: &(i32, i32), val: &Dual<u32>) { self.0.lock().unwrap().push((*key, val.0)); }
+   }
+
+   impl RelIndexMerge for Recorder {
+      // Older versions' observations come first, so the merged recorder stays in observation order.
+      fn move_index_contents(from: &mut Self, to: &mut Self) {
+         to.0.get_mut().unwrap().append(from.0.get_mut().unwrap());
+      }
+   }
+
+   impl Freezable for Recorder {}
+
+   #[macro_export]
+   macro_rules! recording_ds_rel_codegen {
+      ($($tt: tt)*) => {};
+   }
+   pub use recording_ds_rel_codegen as rel_codegen;
+
+   #[macro_export]
+   macro_rules! recording_ds_lat_ind_common {
+      ($name: ident, $ft: ty, $indices: expr, $par: tt, ()) => {
+         $crate::tests::recording_ds::Recorder
+      };
+   }
+   pub use recording_ds_lat_ind_common as lat_ind_common;
+
+   #[macro_export]
+   macro_rules! recording_ds_lat_full_ind {
+      ($name: ident, $ft: ty, $indices: expr, ser, (), $key: ty, $val: ty) => {
+         ascent::internal::RelFullIndexType<$key, $val>
+      };
+      ($name: ident, $ft: ty, $indices: expr, par, (), $key: ty, $val: ty) => {
+         ascent::internal::CRelFullIndex<$key, $val>
+      };
+   }
+   pub use recording_ds_lat_full_ind as lat_full_ind;
+
+   #[macro_export]
+   macro_rules! recording_ds_lat_rel_ind {
+      ($name: ident, $ft: ty, $indices: expr, ser, (), $ind: expr, $key: ty, $val: ty) => {
+         ascent::internal::LatticeIndexType<$key, $val>
+      };
+      ($name: ident, $ft: ty, $indices: expr, par, (), [], $key: ty, $val: ty) => {
+         ascent::internal::CRelNoIndex<$val>
+      };
+      ($name: ident, $ft: ty, $indices: expr, par, (), $ind: expr, $key: ty, $val: ty) => {
+         ascent::internal::CRelIndex<$key, $val>
+      };
+   }
+   pub use recording_ds_lat_rel_ind as lat_rel_ind;
+}
+
+ascent_m_par! {
+   /// A `Dual<u32>` shortest-path lattice whose provider records every `observe` call.
+   pub struct RecordingProg;
+
+   #[lds(crate::tests::recording_ds)]
+   lattice shortest_path(i32, i32, Dual<u32>);
+   relation edge(i32, i32, u32);
+
+   shortest_path(*x, *y, Dual(*w)) <-- edge(x, y, w);
+   shortest_path(*x, *z, Dual(w + l.0)) <-- edge(x, y, w), shortest_path(y, z, l);
+}
+
+/// `observe` must only ever see values that the row actually holds, never a proposed value that lost
+/// the lattice join. Because `Dual<u32>`'s join is `min`, a row's value only ever decreases, so the values
+/// observed for a key must form a strictly decreasing sequence ending at the row's final value. Observing
+/// discarded proposals (as an earlier version of this feature did, by running the hook before the join)
+/// breaks that monotonicity: with these edges, `(1, 3)` gets a direct edge of 40 and a derived path of 80,
+/// and 80 must never be observed after 40.
+#[test]
+fn test_lds_observe_only_accepted_values() {
+   let mut prog = RecordingProg::default();
+   prog.edge = vec![(1, 2, 30), (2, 3, 50), (1, 3, 40)].into_iter().collect();
+   prog.run();
+
+   let recorder = std::mem::take(&mut prog.__shortest_path_ind_common);
+   let final_values: HashMap<(i32, i32), u32> =
+      lat_to_vec(prog.shortest_path).into_iter().map(|(x, y, Dual(w))| ((x, y), w)).collect();
+
+   // Exactly the keys that ended up in the relation were observed.
+   assert_eq!(recorder.keys(), final_values.keys().cloned().collect());
+
+   for (&key, &final_value) in final_values.iter() {
+      let observed = recorder.values_for(key);
+      assert!(!observed.is_empty(), "key {key:?} was never observed");
+      // Strictly decreasing: every observation improved on the previous value the row held.
+      assert!(
+         observed.windows(2).all(|w| w[0] > w[1]),
+         "observations for {key:?} are not strictly decreasing: {observed:?} \
+          (a discarded proposal was observed)"
+      );
+      // The last observation is the value the row settled on.
+      assert_eq!(*observed.last().unwrap(), final_value, "last observation for {key:?} is not the final value");
+   }
+
+   // Specifically: the losing 1 -> 2 -> 3 path of weight 80 never reaches the provider, because the direct
+   // edge of weight 40 is derived first and the join discards 80.
+   assert_eq!(recorder.values_for((1, 3)), vec![40]);
+}
+
+/// Rows put into a lattice directly — rather than derived by a rule — must also reach `observe`;
+/// indexing is the only point at which Ascent learns of them. Re-running the program must not observe
+/// those rows (or any already-observed row) a second time.
+#[test]
+fn test_lds_observes_prepopulated_rows() {
+   let mut prog = RecordingProg::default();
+   prog.shortest_path = lat_from_vec(vec![(7, 8, Dual(1))]);
+   prog.edge = vec![(1, 2, 30)].into_iter().collect();
+   prog.run();
+
+   let observations = prog.__shortest_path_ind_common.observations();
+   assert!(observations.contains(&((7, 8), 1)), "pre-populated row was not observed: {observations:?}");
+   assert!(observations.contains(&((1, 2), 30)), "derived row was not observed: {observations:?}");
+
+   // A second run re-indexes every row but derives nothing new, so it must observe nothing new. Only
+   // checked in serial Ascent: calling `run()` twice already panics in parallel Ascent, `lds` or not.
+   #[cfg(not(feature = "par"))]
+   {
+      let before = prog.__shortest_path_ind_common.observations();
+      prog.run();
+      assert_eq!(prog.__shortest_path_ind_common.observations(), before, "re-running observed rows a second time");
+   }
+}
+
+ascent_m_par! {
+   /// A lattice seeded by a relation initialization, whose provider records every `observe` call.
+   pub struct RecordingInitProg;
+
+   #[lds(crate::tests::recording_ds)]
+   lattice shortest_path(i32, i32, Dual<u32>) = lat_from_vec(vec![(5, 6, Dual(9))]);
+   relation edge(i32, i32, u32);
+
+   shortest_path(*x, *y, Dual(*w)) <-- edge(x, y, w);
+}
+
+/// A `= expr` relation initialization indexes the lattice twice: once when `Default::default()` applies the
+/// initialization, and again at the start of `run()`. The initialized row must still be observed exactly
+/// once.
+#[test]
+fn test_lds_observes_initialized_rows_once() {
+   let mut prog = RecordingInitProg::default();
+   prog.run();
+   assert_eq!(prog.__shortest_path_ind_common.observations(), vec![((5, 6), 9)]);
+}
+
+/// The `test_dl_lattice1` program, with the lattice backed by `crate::btree_lat_ds`: every index of
+/// `shortest_path` is answered from one `BTreeMap` per relation version, and none of Ascent's built-in
+/// lattice index data structures exist.
+#[test]
+fn test_dl_lattice_lds_btree() {
+   ascent_m_par! {
+      #[lds(crate::btree_lat_ds)]
+      lattice shortest_path(i32, i32, Dual<u32>);
+      relation edge(i32, i32, u32);
+
+      shortest_path(*x, *y, Dual(*w)) <-- edge(x, y, w);
+      shortest_path(*x, *z, Dual(w + l.0)) <-- edge(x, y, w), shortest_path(y, z, l);
+
+      edge(1, 2, x + 30)  <-- for x in 0..100;
+      edge(2, 3, x + 50)  <-- for x in 0..100;
+      edge(1, 3, x + 40)  <-- for x in 0..100;
+      edge(2, 4, x + 100) <-- for x in 0..100;
+      edge(1, 4, x + 200) <-- for x in 0..100;
+   }
+   let mut prog = AscentProgram::default();
+   prog.run();
+   // The provider's map holds exactly one entry per row: it is the only index storage there is.
+   assert_eq!(prog.__shortest_path_ind_common.len(), prog.shortest_path.len());
+   assert!(rels_equal(lat_to_vec(prog.shortest_path), [
+      (1, 2, Dual(30)),
+      (1, 3, Dual(40)),
+      (1, 4, Dual(130)),
+      (2, 3, Dual(50)),
+      (2, 4, Dual(100))
+   ]))
+}
+
+/// All-pairs shortest distances between distinct nodes, by Floyd-Warshall: the oracle for
+/// `test_dl_lattice_lds_shortest_path`.
+fn floyd_warshall(edges: &[(i32, i32, u32)]) -> HashMap<(i32, i32), u32> {
+   let nodes = edges.iter().flat_map(|&(a, b, _)| [a, b]).sorted().dedup().collect_vec();
+   let mut dist: HashMap<(i32, i32), u32> = HashMap::new();
+   for &(a, b, w) in edges {
+      let d = dist.entry((a, b)).or_insert(w);
+      *d = (*d).min(w);
+   }
+   for &k in &nodes {
+      for &i in &nodes {
+         let Some(&d_ik) = dist.get(&(i, k)) else { continue };
+         for &j in &nodes {
+            let Some(&d_kj) = dist.get(&(k, j)) else { continue };
+            if dist.get(&(i, j)).is_none_or(|&d| d_ik + d_kj < d) {
+               dist.insert((i, j), d_ik + d_kj);
+            }
+         }
+      }
+   }
+   dist.retain(|&(i, j), _| i != j);
+   dist
+}
+
+/// Shortest paths computed by Datalog through `crate::btree_lat_ds`'s indices, checked against
+/// Floyd-Warshall on a pseudo-random graph with cycles. The recursive rule joins on the lattice's `[0]`
+/// index (a `BTreeMap` range query), the lattice join looks rows up in its `[0, 1]` full index, and the
+/// two query rules read it through `[0]` with a constant and through `[]`.
+#[test]
+fn test_dl_lattice_lds_shortest_path() {
+   ascent_m_par! {
+      #[lds(crate::btree_lat_ds)]
+      lattice shortest_path(i32, i32, Dual<u32>);
+      relation edge(i32, i32, u32);
+      relation from_origin(i32, u32);
+      relation all_dist(i32, i32, u32);
+
+      shortest_path(*x, *y, Dual(*w)) <-- edge(x, y, w);
+      shortest_path(*x, *z, Dual(w + l.0)) <-- edge(x, y, w), shortest_path(y, z, l);
+
+      from_origin(*y, l.0) <-- shortest_path(0, y, l);
+      all_dist(*x, *y, l.0) <-- shortest_path(x, y, l);
+   }
+
+   // A deterministic pseudo-random graph on 25 nodes, dense enough to have many cycles and many paths
+   // that improve on direct edges.
+   let mut seed: u64 = 0x5eed;
+   let mut next = move |n: u64| {
+      seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+      (seed >> 33) % n
+   };
+   let edges = (0..120).map(|_| (next(25) as i32, next(25) as i32, next(50) as u32 + 1)).collect_vec();
+   let expected = floyd_warshall(&edges);
+
+   let mut prog = AscentProgram::default();
+   prog.edge = edges.iter().cloned().collect();
+   prog.run();
+
+   // `shortest_path` also holds self-loops (i, i) for nodes on a cycle, which the oracle leaves out.
+   let computed: HashMap<(i32, i32), u32> =
+      lat_to_vec(prog.shortest_path).into_iter().map(|(x, y, Dual(w))| ((x, y), w)).collect();
+   let computed_non_loops: HashMap<(i32, i32), u32> =
+      computed.iter().filter(|((i, j), _)| i != j).map(|(&k, &v)| (k, v)).collect();
+   assert_eq!(computed_non_loops, expected);
+   assert!(computed.len() > 100, "graph too sparse to exercise the indices: {} paths", computed.len());
+
+   assert!(rels_equal(prog.all_dist, computed.iter().map(|(&(x, y), &w)| (x, y, w))));
+   assert!(rels_equal(
+      prog.from_origin,
+      computed.iter().filter(|((x, _), _)| *x == 0).map(|(&(_, y), &w)| (y, w))
+   ));
+   assert_eq!(prog.__shortest_path_ind_common.len(), computed.len());
 }
 
 #[test]

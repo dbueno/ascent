@@ -4,6 +4,7 @@
 
 mod ascent_maybe_par;
 mod tests;
+pub mod btree_lat_ds;
 pub mod utils;
 mod se;
 mod exps;

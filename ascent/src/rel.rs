@@ -66,6 +66,55 @@ macro_rules! rel_ind {
 }
 pub use rel_ind;
 
+// The macros below define the default data structure provider for `lattice` relations, used both for
+// lattices without a `#[lds(..)]` attribute and for `#[lds(ascent::rel)]`. A lattice's rows live in the
+// built-in row store; a lattice provider supplies the index data structures. As with `rel_ind_common!`
+// for a `ds` provider, `lat_ind_common!` is a value shared by all of the relation's indices (one per
+// relation version), and every index is accessed through `ToRelIndex` against it, so a provider can back
+// all of a lattice's indices with a single data structure. `lat_full_ind!` yields the "full index" mapping
+// the key columns (all but the lattice column) to the single row holding the joined value, and
+// `lat_rel_ind!` yields every other (multi-valued, set-semantics) index. `$val` is always `usize` (a row
+// reference).
+
+// The data shared by a lattice's indices. It must implement `RelIndexMerge` (and `Freezable` in parallel
+// Ascent), plus `LatIndCommon` (serial) or `CLatIndCommon` (parallel), whose `observe` hook sees the key and
+// joined lattice value of every row entering the relation. The default provider shares nothing.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! lat_ind_common {
+   ($name: ident, $field_types: ty, $indices: expr, $par: tt, ()) => {
+      ()
+   };
+}
+pub use lat_ind_common;
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! lat_full_ind {
+   ($name: ident, $field_types: ty, $indices: expr, ser, (), $key: ty, $val: ty) => {
+      ascent::internal::RelFullIndexType<$key, $val>
+   };
+   ($name: ident, $field_types: ty, $indices: expr, par, (), $key: ty, $val: ty) => {
+      ascent::internal::CRelFullIndex<$key, $val>
+   };
+}
+pub use lat_full_ind;
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! lat_rel_ind {
+   ($name: ident, $field_types: ty, $indices: expr, ser, (), $ind: expr, $key: ty, $val: ty) => {
+      ascent::internal::LatticeIndexType<$key, $val>
+   };
+   ($name: ident, $field_types: ty, $indices: expr, par, (), [], $key: ty, $val: ty) => {
+      ascent::internal::CRelNoIndex<$val>
+   };
+   ($name: ident, $field_types: ty, $indices: expr, par, (), $ind: expr, $key: ty, $val: ty) => {
+      ascent::internal::CRelIndex<$key, $val>
+   };
+}
+pub use lat_rel_ind;
+
 #[derive(Clone)]
 pub struct ToRelIndexType<K, V>(pub RelIndexType1<K, V>);
 
@@ -94,7 +143,7 @@ impl<K, V, R> ToRelIndex<R> for ToRelIndexType<K, V> {
    fn to_rel_index_write<'a>(&'a mut self, _rel: &'a mut R) -> Self::RelIndexWrite<'a> { &mut self.0 }
 }
 
-use crate::internal::{Freezable, RelFullIndexType, RelIndexMerge, RelIndexType1};
+use crate::internal::{Freezable, LatticeIndexType, RelFullIndexType, RelIndexMerge, RelIndexType1};
 use crate::to_rel_index::ToRelIndex;
 
 impl<K, V, Rel> ToRelIndex<Rel> for RelIndexType1<K, V> {
@@ -116,6 +165,24 @@ impl<K, V, Rel> ToRelIndex<Rel> for RelIndexType1<K, V> {
 }
 
 impl<K, V, Rel> ToRelIndex<Rel> for RelFullIndexType<K, V> {
+   type RelIndex<'a>
+      = &'a Self
+   where
+      Self: 'a,
+      Rel: 'a;
+   #[inline(always)]
+   fn to_rel_index<'a>(&'a self, _rel: &'a Rel) -> Self::RelIndex<'a> { self }
+
+   type RelIndexWrite<'a>
+      = &'a mut Self
+   where
+      Self: 'a,
+      Rel: 'a;
+   #[inline(always)]
+   fn to_rel_index_write<'a>(&'a mut self, _rel: &'a mut Rel) -> Self::RelIndexWrite<'a> { self }
+}
+
+impl<K, V, Rel> ToRelIndex<Rel> for LatticeIndexType<K, V> {
    type RelIndex<'a>
       = &'a Self
    where

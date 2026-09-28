@@ -87,6 +87,49 @@ pub trait CRelFullIndexWrite {
    fn insert_if_not_present(&self, key: &Self::Key, v: Self::Value) -> bool;
 }
 
+/// The lookups parallel Ascent performs on a lattice's full index (the index from the key columns, i.e. all
+/// columns but the lattice column, to the single row holding the joined value) when adding a row to it.
+/// A lattice `#[lds(..)]` provider's full index view must implement this in parallel Ascent.
+pub trait CLatFullIndexRead {
+   type Key;
+   type Value;
+   /// The hash of `key`, used to pick which lattice insertion mutex guards `key`.
+   fn hash_usize(&self, key: &Self::Key) -> usize;
+   /// The row holding the lattice value for `key`, if there is one.
+   fn get_cloned(&self, key: &Self::Key) -> Option<Self::Value>;
+}
+
+impl<T: CLatFullIndexRead + ?Sized> CLatFullIndexRead for &T {
+   type Key = T::Key;
+   type Value = T::Value;
+   #[inline(always)]
+   fn hash_usize(&self, key: &Self::Key) -> usize { (**self).hash_usize(key) }
+   #[inline(always)]
+   fn get_cloned(&self, key: &Self::Key) -> Option<Self::Value> { (**self).get_cloned(key) }
+}
+
+/// Implemented by the `lat_ind_common!` type of a lattice `#[lds(..)]` provider in serial Ascent.
+///
+/// `observe` is called with the key columns and the (already joined) lattice value of every row that
+/// enters the relation, and again whenever an existing row's lattice value changes. It is the one place a
+/// provider sees the lattice value itself; its indices only ever see `usize` row references.
+pub trait LatIndCommon<Key, Lat> {
+   #[allow(unused_variables)]
+   #[inline(always)]
+   fn observe(&mut self, key: &Key, val: &Lat) {}
+}
+
+/// The parallel counterpart of [`LatIndCommon`]. `c_observe` runs on rayon worker threads, possibly
+/// concurrently, so it takes `&self` and the implementation must use interior mutability.
+pub trait CLatIndCommon<Key, Lat> {
+   #[allow(unused_variables)]
+   #[inline(always)]
+   fn c_observe(&self, key: &Key, val: &Lat) {}
+}
+
+impl<Key, Lat> LatIndCommon<Key, Lat> for () {}
+impl<Key, Lat> CLatIndCommon<Key, Lat> for () {}
+
 pub type RelIndexType1<K, V> = HashMap<K, Vec<V>, BuildHasherDefault<FxHasher>>;
 
 pub static mut MOVE_REL_INDEX_CONTENTS_TOTAL_TIME: Duration = Duration::ZERO;

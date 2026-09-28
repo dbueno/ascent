@@ -19,3 +19,25 @@ fn test_agg_not_stratifiable() {
    assert!(res.is_err());
    assert!(res.unwrap_err().to_string().contains("bar"));
 }
+
+#[test]
+fn test_ds_on_lattice_is_error() {
+   let inp = quote! {
+      #[ds(ascent::rel)]
+      lattice foo(i32, i32, u32);
+   };
+   let res = ascent_impl(inp, AscentMacroKind::default());
+   assert!(res.is_err());
+   assert!(res.unwrap_err().to_string().contains("lds"));
+}
+
+#[test]
+fn test_lds_on_relation_is_error() {
+   let inp = quote! {
+      #[lds(ascent::rel)]
+      relation foo(i32, i32);
+   };
+   let res = ascent_impl(inp, AscentMacroKind::default());
+   assert!(res.is_err());
+   assert!(res.unwrap_err().to_string().contains("lattice"));
+}
